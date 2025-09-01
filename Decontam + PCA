@@ -1,0 +1,382 @@
+setwd("~/Desktop/BAL_data")
+
+library(readr)
+library(qiime2R)
+library(phyloseq)
+library(ggplot2)
+library(decontam)
+library(dplyr)
+library(tibble)
+library(microbiome)
+library(ggrepel)
+library(vegan)
+
+#Load the metadata file into the environment
+metadata <- read_csv("Manifest-Map_BAL.csv")
+
+#Rename the columns
+metadata <- metadata %>%
+  rename(
+    SampleID = `sample-id`,
+    DNA_ng_ul = `DNA (ng/ul)`,
+    SequencingID = `sequencing-id`,
+    Sample_type = `SampleType`,
+    Forward_absolute_filepath = `forward-absolute-filepath`,
+    Reverse_absolute_filepath = `reverse-absolute-filepath`
+  )
+  
+#Check for full duplicates and remove them
+dups_full <- metadata[duplicated(metadata), ]
+print(dups_full)
+metadata <- metadata %>% distinct()
+
+#Check that they've been removed
+dups_full <- metadata[duplicated(metadata), ]
+print(nrow(dups_full)) # Should be 0
+
+#Remove rows with missing DNA concentration
+manifest_cleaned <- metadata %>%
+  filter(!is.na(DNA_ng_ul))
+
+#Remove columns 'Visit' and 'sheet' using dplyr::select
+manifest_cleaned <- dplyr::select(manifest_cleaned, -Visit, -sheet)
+
+#Remove columns 'Forward_absolute_filepath', 'Reverse_absolute_filepath' and 'SequencingID' using dplyr::select
+manifest_cleaned <- dplyr::select(manifest_cleaned, -Reverse_absolute_filepath, -SequencingID, -Forward_absolute_filepath)
+
+#Remove rows where DNA_ng_ul == 0
+manifest_filtered_IN <- manifest_cleaned %>%
+  filter(DNA_ng_ul != 0)
+  
+#Filter Diagnosis to include only 'Control', 'IPF', and 'Positive Control'
+manifest_filtered_IN <- manifest_cleaned %>%
+  filter(Diagnosis %in% c("Control", "IPF"))
+
+#Change "Control" to "Negative Control" in the Diagnosis column
+manifest_filtered_IN$Diagnosis <- recode(manifest_filtered_IN$Diagnosis,
+                                          "Control" = "Negative Control")
+
+#Remove duplicates of SampleID "NUPOS-2", keeping only one instance
+manifest_filtered_IN <- manifest_filtered_IN %>%
+  distinct(SampleID, .keep_all = TRUE)
+
+#Decontamination script to generate all files for Microbiome plots
+#The following 3 files have been generated using the QIIME2-CHP-Script
+physeq <- qza_to_phyloseq("BAL-filtered-table-gg2.qza","BAL-midrooted-tree.qza","BAL-filtered-taxonomy-gg2.qza")
+print(physeq)
+print(sample_names(physeq))
+first_sample_name <- sample_names(physeq)
+mapping = read.csv("manifest_unfiltered_IN.csv", header = TRUE)
+
+# Find the duplicated SampleIDs
+duplicated_sample_ids <- mapping$SampleID[duplicated(mapping$SampleID)]
+
+if (length(duplicated_sample_ids) > 0) {
+  print("The following SampleIDs are duplicated in your mapping file:")
+  print(unique(duplicated_sample_ids)) # Print unique list of the duplicates
+  print(paste("Total number of duplicated SampleID entries:", length(duplicated_sample_ids)))
+} else {
+  print("No duplicate SampleIDs found. (This message should not appear if you just got the error.)")
+}
+
+# Remove duplicated SampleIDs 
+mapping <- mapping[!duplicated(mapping$SampleID), ]
+
+# Set rownames for compatibility with phyloseq
+mapping = column_to_rownames(mapping, "SampleID")
+
+# Assign cleaned mapping file to phyloseq object
+sample_data(physeq)<-mapping
+
+# --- CONTAMINATION STEP ---
+# Looking for contamination
+ps<-physeq 
+df <- as.data.frame(sample_data(ps)) 
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_type)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Library Size vs Sample Index", y = "Library Size", x = "Sample Index")
+  
+# Identify negative controls based on Sample_type
+# The code contains sequencing control as a negative control but they've all already been removed (half of them had DNA conc of zero and the other half were positive controls which I filtered before contamination step)
+sample_data(ps)$is.neg <- sample_data(ps)$Sample_type %in% c("BAL Flush", "Reagent Control")
+
+# Run decontam using the combined method (frequency + prevalence)
+# 'DNA_ng_ul' is the DNA concentration column
+# 'is.neg' indicates which samples are negative controls
+contamdf.freq <- isContaminant(ps, method="combined", conc="DNA_ng_ul", neg="is.neg", threshold=0.1)
+
+# How many contaminants were detected
+table(contamdf.freq$contaminant)
+
+# Plot frequency vs DNA concentration for 16 randomly selected contaminants
+# Red line = model of contaminant (inversely proportional to DNA conc)
+# Those all look like contaminants based on the association with the red line 
+# Black dashed line = model of non-contaminant (flat/independent of DNA conc)
+plot_frequency(ps, taxa_names(ps)[sample(which(contamdf.freq$contaminant), 16)], conc = "DNA_ng_ul") +
+  xlab("DNA Concentration (ng/µl, Qubit)")
+
+# Manually curate and examine the contaminants
+# First get interpretable names
+tax <- as(tax_table(ps), "matrix")
+contaminants <- tax[which(contamdf.freq$contaminant),]
+
+# Prune contaminants from the phyloseq object 
+ps_decontam <- prune_taxa(!contamdf.freq$contaminant, ps) 
+summarize_phyloseq(ps_decontam)
+
+# Look at distribution of remaining taxa (after removing contaminants)
+plot_bar(ps_decontam) +
+  ggtitle("Distribution of ASVs after contaminant removal")
+
+# Make sure ps.contam exists
+contaminant_taxa <- rownames(contamdf.freq)[contamdf.freq$contaminant == TRUE]
+ps.contam <- prune_taxa(contaminant_taxa, ps)
+
+# Filter for contaminants with ≥1000 reads
+filter <- phyloseq::genefilter_sample(ps.contam, filterfun_sample(function(x) x >= 1000))
+ps.contam.1k <- prune_taxa(filter, ps.contam)
+
+# Check if anything passed the filter
+ntaxa(ps.contam.1k)  # Should be > 0
+
+# Extract OTU table
+otu_table_contam_1k <- as.data.frame(otu_table(ps.contam.1k))
+
+# Check if tax is now a dataframe
+tax_df <- as.data.frame(tax) 
+is.data.frame(tax_df)
+
+contam_details <- left_join(rownames_to_column(otu_table_contam_1k, var = "ASV"), # Fixed: Use otu_table_contam_1k
+                            rownames_to_column(tax_df, var = "ASV"),
+                            by = "ASV")
+write.table(contam_details, file="contamination_IN_final.txt", col.names=NA, row.names=T,sep="\t")
+
+#Remove contaminants
+ps.noncontam <- prune_taxa(!contamdf.freq$contaminant, ps)
+ps.noncontam
+summarize_phyloseq(ps.noncontam)
+
+# Get the taxonomic table as a matrix from ps.noncontam
+tax_table_matrix_noncontam <- as(tax_table(ps.noncontam), "matrix")
+
+# Identify ALL Salmonella ASV IDs (using both specific variants)
+# Now searching for BOTH "Salmonella_683375" AND "Salmonella_692099"
+salmonella_asvs <- rownames(tax_table_matrix_noncontam)[
+  tax_table_matrix_noncontam[,"Genus"] %in% c("Salmonella_683375", "Salmonella_692099")
+]
+
+# Print the identified ASV IDs to verify
+print("Salmonella ASVs found for manual removal:")
+print(salmonella_asvs)
+
+# Define the badTaxa list, including all identified Salmonella ASVs
+  salmonella_asvs # This now correctly adds all identified Salmonella ASV IDs
+)
+
+# Perform the manual pruning *before* the phylum filtering
+goodTaxa <- setdiff(taxa_names(ps.noncontam), badTaxa)
+ps.noncontam_manually_pruned <- prune_taxa(goodTaxa, ps.noncontam)
+
+# Check the genus table of your manually pruned object
+print(table(as(tax_table(ps.noncontam_manually_pruned), "matrix")[,"Genus"]))
+
+# Define the object for downstream analysis
+current_ps <- ps.noncontam_manually_pruned
+summarize_phyloseq(current_ps)
+
+# Extract tax_table from the current_ps object as a data frame
+tax_current_ps <- as(tax_table(current_ps), "matrix")
+tax_current_ps_df <- as.data.frame(tax_current_ps)
+
+# Get list of unique Phyla (non-NA only)
+filterPhyla <- unique(tax_current_ps_df$Phylum)
+filterPhyla <- na.omit(filterPhyla)
+
+# Subset the current_ps object to retain only taxa with Phylum in filterPhyla
+ps_phylum_filtered = subset_taxa(current_ps, !(!Phylum %in% filterPhyla))
+
+# Check how many taxa were retained
+ps_phylum_filtered
+summarize_phyloseq(ps_phylum_filtered)
+
+# Filter at 0.005% of total reads across the samples
+minTotRelAbun = 0.00005
+x = taxa_sums(ps_phylum_filtered)
+keepTaxa = which((x / sum(x)) > minTotRelAbun)
+prunedSet_IN = prune_taxa(names(keepTaxa), ps_phylum_filtered)
+prunedSet_IN # Now contains all samples after filtering
+
+# Check which taxa were thrown out
+thrownTaxa = which((x / sum(x)) < minTotRelAbun)
+trashSet_IN = prune_taxa(names(thrownTaxa), ps_phylum_filtered)
+tax_trash_df_IN <- as.data.frame(as(tax_table(trashSet_IN), "matrix"))
+View(tax_trash_df_IN)
+
+sum(taxa_sums(prunedSet_IN)==0) # should be 0
+
+# Normalising samples i.e., relative abundances
+# This function normalizes each sample (each column) so that the total counts for each sample sum to 1 (relative abundance)
+normalizeSample = function(x) { x / sum(x) }
+
+# Apply normalization to the object containing all samples
+Controls_relative_IN = transformSampleCounts(prunedSet_IN, normalizeSample)
+
+# Extract ASV-level relative abundance matrix
+OTU1_IN = as(otu_table(Controls_relative_IN), "matrix")
+
+# Check if taxa are rows and transpose if necessary
+if (!taxa_are_rows(Controls_relative_IN)) {
+  OTU1_IN = t(OTU1_IN)  # Transpose if taxa are columns (i.e., taxa are NOT rows)
+} else {
+  OTU1_IN = OTU1_IN  # If taxa are already rows, just use OTU1_INP as is
+}
+
+# Convert to dataframe
+OTUdf_IN = as.data.frame(OTU1_IN)
+write.csv(OTUdf_IN, "OTUdf_IN.csv") # Renamed file for clarity
+
+# Extract taxonomic table for all ASVs in the filtered dataset
+# This extracts a taxonomic table that contains all the OTUs that are present in the filtered dataset which contains the IPF samples from 90 patients 
+# These OTUs have passed the filtering steps 
+TAXdf_IN = as(tax_table(Controls_relative_IN), "matrix")
+TAXdf_IN = as.data.frame(TAXdf_IN)
+write.csv(TAXdf_IN, "tax_table_IN.csv") # Renamed file for clarity
+
+# Aggregate and write relative abundance tables for all samples at different taxonomic levels
+# This takes the relative abudance of microbial taxa in the IPF dataset and groups them by different taxonomic levels (Phylum, Class, Family, and Genus)
+# Helps inspect the distribution of microbial taxa at different taxonomic levels 
+Controls_Phylum_IN <- aggregate_taxa(Controls_relative_IN, 'Phylum')
+otu_table_phylum <- as.data.frame(Controls_Phylum_IN@otu_table)
+write.table(otu_table_phylum, "Phylum-relative-abundance_IN_FINAL.txt", col.names=NA, row.names=T,sep="\t")
+
+Controls_Class_IN <- aggregate_taxa(Controls_relative_IN, 'Class')
+otu_table_class <- as.data.frame(Controls_Class_IN@otu_table)
+write.table(otu_table_class,file="Class-relative-abundance_IN_FINAL.txt", col.names=NA, row.names=T,sep="\t") 
+
+Controls_Family_IN <- aggregate_taxa(Controls_relative_IN, 'Family')
+otu_table_family <- as.data.frame(Controls_Family_IN@otu_table)
+write.table(otu_table_family,file="Family-relative-abundance_IN_FINAL.txt", col.names=NA, row.names=T,sep="\t")
+
+Controls_Genus_IN <- aggregate_taxa(Controls_relative_IN, 'Genus')
+otu_table_genus <- as.data.frame(Controls_Genus_IN@otu_table)
+write.table(otu_table_genus,file="Genus-relative-abundance_IN_FINAL.txt", col.names=NA, row.names=T,sep="\t") 
+
+##### Negative Control images #####
+#### Negative PCOA Plot ####
+
+# Load the Genus relative abundance data (without merged metadata)
+abund_table_IN <- read_tsv("Genus-relative-abundance_IN_FINAL.txt")
+
+# Set Genus names as row names 
+genus_data_for_transpose <- column_to_rownames(abund_table_IN, var = "...1") 
+
+# Transpose the data
+transposed_abund_matrix <- t(genus_data_for_transpose)
+
+# Convert to data frame
+transposed_abund_IN <- as.data.frame(transposed_abund_matrix)
+
+# Convert all columns in the transposed data frame to numeric
+# The `lapply` function applies `as.numeric` to every column.
+transposed_abund_IN[] <- lapply(transposed_abund_IN, as.numeric)
+
+# Load metadata separately 
+metadata_for_plot <- read_csv("manifest_filtered_IN.csv")
+
+# Find duplicated SampleIDs
+metadata_for_plot %>%
+  filter(duplicated(SampleID) | duplicated(SampleID, fromLast = TRUE))
+
+# Remove duplicates and keep one copy
+metadata_for_plot <- metadata_for_plot %>%
+  distinct(SampleID, .keep_all = TRUE)
+
+# Set SampleID as row names
+metadata_for_plot <- metadata_for_plot %>%
+   column_to_rownames(var = "SampleID") # Ensure SampleIDs are row names to match abund_table
+   
+#Align abundance data with filtered metadata samples 
+# Get the SampleIDs that are present in the final filtered metadata
+final_sample_ids <- rownames(metadata_for_plot)
+
+# Subset the abundance data to *only* include these final samples
+transposed_abund_IN_filtered <- transposed_abund_IN[rownames(transposed_abund_IN) %in% final_sample_ids, , drop = FALSE]
+
+#Remove columns with zero variance
+# Calculate the variance for each column (genus)
+col_variances <- apply(transposed_abund_IN_filtered, 2, var)
+
+# Identify columns that have zero variance (or are constant)
+# (Small epsilon added for floating point comparisons, or just check == 0)
+# A very common and robust way is to keep only columns with variance > 0
+columns_to_keep <- names(col_variances[col_variances > 0])
+
+# Filter the abundance table to keep only those columns
+transposed_abund_IN_PCA_ready <- transposed_abund_IN_filtered[, columns_to_keep, drop = FALSE]
+
+# Perform PCA on the *filtered* abundance table
+Negative_PCA <- prcomp(transposed_abund_IN_PCA_ready, scale. = TRUE)
+
+# Extract PCA coordinates and combine with metadata for plotting
+pca_scores <- as.data.frame(Negative_PCA$x[, 1:2])
+pca_scores$SampleID <- rownames(pca_scores)
+
+# Join PCA scores with your metadata (metadata_for_plot is already correctly filtered)
+metadata_for_plot <- metadata_for_plot %>% rownames_to_column(var = "SampleID") # Convert SampleID back to column for left_join
+Negative_PCA2 <- left_join(pca_scores, metadata_for_plot, by = "SampleID")
+
+
+# Perform PCA on the abundance table
+Negative_PCA <- prcomp(transposed_abund_IN_PCA_ready, scale. = TRUE)
+pc1_variance <- summary(Negative_PCA)$importance[2, 1] * 100
+pc2_variance <- summary(Negative_PCA)$importance[2, 2] * 100
+
+# Extract PCA coordinates and combine with metadata for plotting
+pca_scores <- as.data.frame(Negative_PCA$x[, 1:2]) # Get PC1 and PC2 scores
+pca_scores$SampleID <- rownames(pca_scores) # Add SampleID column from rownames
+
+# Join PCA scores with metadata
+# Ensure `metadata_clean` has a 'sample-id' column that matches `pca_scores$sample_id`
+# Or, if `metadata_clean` has sample_id as rownames, convert it to a column for joining:
+metadata_for_plot <- metadata_for_plot %>% rownames_to_column(var = "SampleID")
+
+Negative_PCA2 <- left_join(pca_scores, metadata_for_plot, by = "SampleID")
+
+#Re-factor to enforce plotting order
+Negative_PCA2$Diagnosis <- factor(Negative_PCA2$Diagnosis,
+    levels = c("IPF", "Negative Control"))
+
+# To demonstrate that negative controls are different from TRUE BAL samples
+ggplot(Negative_PCA2, aes(PC1, PC2, colour = Diagnosis)) +
+  geom_point(aes(shape = Diagnosis, fill = Diagnosis), size = 2.5) +
+  stat_ellipse(aes(fill = Diagnosis), geom = "polygon", alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "C8", color = "black", size = 0.2) +
+  geom_vline(xintercept = 0, linetype = "C8", color = "black", size = 0.2) +
+  labs(
+    x = paste("PC1 (", round(pc1_variance, 2), "%)", sep = ""),
+    y = paste("PC2 (", round(pc2_variance, 2), "%)", sep = "")
+  ) +
+  scale_fill_manual(values = c("IPF" = "#fff963", "Controls" = "#fa8072")) +
+  scale_colour_manual(values = c("IPF" = "#f4ca16", "Controls" = "#eb4c42")) +
+  scale_shape_manual(values = c(21, 22)) +
+  theme_minimal(base_size = 10) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),  # Set legend text size to 10
+    aspect.ratio = 1,
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+    axis.text.x = element_text(size = 11, color = "black"),  # Set x-axis text size and color
+    axis.text.y = element_text(size = 11, color = "black"),  # Set y-axis text size and color
+    axis.title.x = element_text(size = 12, color = "black"),  # Set x-axis title size and color
+    axis.title.y = element_text(size = 12, color = "black")   # Set y-axis title size and color
+  ) +
+  coord_cartesian(xlim = c(-7, 7), ylim = c(-5, 5))
+
+# Save the plot
+ggsave("final_removed.pdf", width = 150, height = 150, units = "mm", dpi = 300)
