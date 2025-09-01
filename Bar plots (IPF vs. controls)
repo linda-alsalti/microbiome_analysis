@@ -1,0 +1,188 @@
+setwd("~/Desktop/BAL_data")
+
+library(readr)     
+library(tidyverse)
+library(stringr)   
+library(reshape2)
+
+#Load the genus relative abundance data (without merged metadata)
+abund_table_IN <- read_tsv("Genus-relative-abundance_IN_FINAL.txt")
+
+#Set Genus names as row names 
+genus_data_for_transpose <- column_to_rownames(abund_table_IN, var = "...1") 
+
+#Transpose the data
+transposed_abund_matrix <- t(genus_data_for_transpose)
+
+#Convert to data frame
+transposed_abund_IN_genus <- as.data.frame(transposed_abund_matrix)
+
+#Convert all columns in the transposed data frame to numeric
+#The `lapply` function applies `as.numeric` to every column
+transposed_abund_IN_genus[] <- lapply(transposed_abund_IN_genus, as.numeric)
+
+#Extract base genus names from column names
+cleaned_colnames <- str_extract(colnames(transposed_abund_IN_genus), "^[^_]+")
+
+#Assign the cleaned genus names back to the columns
+colnames(transposed_abund_IN_genus) <- cleaned_colnames
+
+#Group columns with the same genus name and sum their abundances
+#Use 'group_by' for columns, so we transpose to long format, sum, then reshape again
+
+#Move to long format
+transposed_abund_IN_genus$SampleID <- rownames(transposed_abund_IN_genus)  # Make SampleID a column
+long_df <- pivot_longer(transposed_abund_IN_genus, 
+                        cols = -SampleID, 
+                        names_to = "Genus", 
+                        values_to = "Abundance")
+
+#Group by SampleID and Genus, then sum
+summed_df <- long_df %>%
+  group_by(SampleID, Genus) %>%
+  summarise(Total_Abundance = sum(Abundance, na.rm = TRUE), .groups = "drop")
+
+#Pivot back to wide format: SampleID as rows, genus as columns
+cleaned_abund_df_genus <- pivot_wider(summed_df, 
+                                names_from = Genus, 
+                                values_from = Total_Abundance)
+
+#Set rownames again
+cleaned_abund_df_genus <- as.data.frame(cleaned_abund_df_genus)
+rownames(cleaned_abund_df_genus) <- cleaned_abund_df_genus$SampleID
+cleaned_abund_df_genus$SampleID <- NULL
+
+#Load metadata separately 
+metadata_for_barplot <- read_csv("manifest_unfiltered_IN.csv")
+
+#Find duplicated SampleIDs
+metadata_for_barplot %>%
+  filter(duplicated(SampleID) | duplicated(SampleID, fromLast = TRUE))
+
+#Remove duplicates and keep one copy
+metadata_for_barplot <- metadata_for_barplot %>%
+  distinct(SampleID, .keep_all = TRUE)
+
+#Set SampleID as row names
+metadata_for_barplot <- metadata_for_barplot %>%
+   column_to_rownames(var = "SampleID") # Ensure SampleIDs are row names to match abund_table
+
+#Join the abundance data and metadata into a single data frame
+#inner_join was used to ensure only samples present in BOTH are kept
+combined_data_for_barplot <- inner_join(
+  rownames_to_column(cleaned_abund_df_genus, var = "SampleID"),
+  rownames_to_column(metadata_for_barplot, var = "SampleID"),
+  by = "SampleID"
+) %>% column_to_rownames(var = "SampleID") # Set SampleID back to row names if desired for consistency
+
+#Stacked bar plot by diagnosis 
+#At genus level
+df_genus <- combined_data_for_barplot %>%
+  # Filter to keep ONLY IPF and Negative Control diagnoses directly
+  filter(Diagnosis == "IPF" | Diagnosis == "Negative Control")
+
+#Prepare meta_table
+meta_table <- df_genus %>%
+  dplyr::select(PatientID, Diagnosis, Sample_type, DNA_ng_ul)
+
+#Prepare abund_table
+abund_table <- df_genus %>%
+  dplyr::select(Abiotrophia:Yimella)
+  
+#Calculate row sums (Quality Check)
+rowSums_check <- rowSums(abund_table)
+print(rowSums_check) # Optional: Run this line to check if sums are 100 or other values.
+
+abund_table <- abund_table / rowSums(abund_table) * 100
+
+#Top ten family taxa
+top <- abund_table[,order(colSums(abund_table),decreasing=TRUE)]
+N <- 10
+taxa_list <- c("Prevotella", "Streptococcus", 
+                                 "Pseudomonas", "Bacillus", 
+                                 "Veillonella", "Listeria", 
+                                 "Enterococcus", "Sphingomonas",
+                                 "Haemophilus", "Neisseria")
+top <- abund_table[, taxa_list]
+
+#Renormalize so the selected taxa sum to 100% per sample
+top <- top / rowSums(top) * 100
+
+df_genus_top <- cbind(meta_table, top)
+
+# tatistical analysis (IPF vs. Negative Control)
+wilcox.test(Prevotella ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16
+wilcox.test(Streptococcus ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16
+wilcox.test(Pseudomonas ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16
+wilcox.test(Bacillus ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16 
+wilcox.test(Veillonella ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16
+wilcox.test(Listeria ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16
+wilcox.test(Enterococcus ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16
+wilcox.test(Sphingomonas ~ Diagnosis, df_genus_top) #p-value = 0.08414 -> NOT statistically significant
+wilcox.test(Haemophilus ~ Diagnosis, df_genus_top) #p-value = < 2.2e-16
+wilcox.test(Neisseria ~ Diagnosis, df_genus_top) #p-value = 5.476e-15
+
+df_long <- melt(df_genus_top, id.vars = "Diagnosis", 
+                measure.vars = c("Prevotella", "Streptococcus", 
+                                 "Pseudomonas", "Bacillus", 
+                                 "Veillonella", "Listeria", 
+                                 "Enterococcus", "Sphingomonas",
+                                 "Haemophilus", "Neisseria"), 
+                variable.name = "Genus",
+                factorsAsStrings = TRUE, na.rm = TRUE)
+df_long_summarised <- df_long %>%
+  group_by(Diagnosis, Genus) %>%
+  summarise(mean_value=mean(value),
+            median=median(value),
+            sd=sd(value),
+            q1 = quantile(value, 0.25),  # 1st quartile
+            q3 = quantile(value, 0.75)) # 3rd quartile
+df_long_summarised$Diagnosis <- ordered(df_long_summarised$Diagnosis, levels = c("IPF","Negative Control"))
+
+ggplot(df_long_summarised, aes(x=Diagnosis, y=mean_value)) +
+  geom_bar(aes(y = mean_value, x = Diagnosis, fill = Genus),
+           stat="identity",
+           position=position_stack(),
+           color = "black", 
+           linewidth = 0.2,
+           width = 0.74) +
+  scale_fill_manual(values = c("#8cd3c8", "#b5e2bf", "#f7f8b6", "#f0d1e1", "#bbb9d8", "#7fb0d3", "#c191c1", "#f17f72", "#ffc87c", "#d7d7d4")) +
+  theme_classic() +
+  labs(x = "", y = "Mean relative abundance (%)") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1,
+      size = 11,
+      face = "plain",
+      color = "black"
+    ),
+    axis.title.x = element_text(
+      size = 11,
+      face = "plain",
+      color = "black"
+    ),
+    axis.title.y = element_text(
+      size = 11,
+      face = "plain",
+      color = "black"
+    ),
+    axis.text.y = element_text(size = 10),
+    axis.line = element_line(linewidth = 0.5, color = "black"),
+    panel.border = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.background = element_blank(),
+    panel.background = element_blank(),
+    legend.position = "right",
+    legend.title = element_text(size = 11, face = "bold"),
+    legend.text = element_text(size = 10, face = "italic"),
+    legend.key = element_blank()
+  ) +
+  guides(fill = guide_legend(title = "Genus")) +
+  scale_x_discrete(labels = c("IPF" = "IPF", "Negative Control" = "Controls"),
+                 drop = FALSE)
+
+ggsave("Barplot_genus.pdf", width=11, height = 15, unit="cm")
